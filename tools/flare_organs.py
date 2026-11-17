@@ -17,6 +17,7 @@
 Примеры:
   python tools/flare_organs.py list
   python tools/flare_organs.py inspect --organ all
+  python tools/flare_organs.py download --organ pancreas --dry-run
   python tools/flare_organs.py download --organ pancreas --out data
   python tools/flare_organs.py list --json
 
@@ -29,6 +30,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import sys
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote
@@ -116,8 +118,17 @@ def organ_url(key: str) -> str:
     return f"https://huggingface.co/datasets/{DATASET_ID}/tree/main/{ORGANS[key]['subset']}"
 
 
+def _token() -> str | None:
+    """Токен Hugging Face из окружения (пустая строка считается отсутствием токена)."""
+    return (
+        os.environ.get("HF_TOKEN")
+        or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+        or None
+    )
+
+
 def _headers() -> dict:
-    token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+    token = _token()
     headers = {"User-Agent": USER_AGENT}
     if token:
         headers["Authorization"] = f"Bearer {token}"
@@ -158,6 +169,74 @@ def fetch_tree(path: str) -> list:
         except URLError as exc:
             raise SystemExit(f"Нет связи с huggingface.co: {exc.reason}")
     return entries
+
+
+def _exception_names(exc: BaseException) -> set:
+    """Имена классов ошибки и её предков.
+
+    Такой способ не зависит от версии huggingface_hub: в 1.x классы ошибок лежат
+    на верхнем уровне пакета, в 2.x — в huggingface_hub.errors и не реэкспортируются.
+    """
+    return {cls.__name__ for cls in type(exc).__mro__}
+
+
+def download_error(exc: Exception, subset: str) -> str:
+    """Понятное объяснение ошибки скачивания вместо трейсбека клиента."""
+    message = str(exc)
+    lowered = message.lower()
+    token = bool(_token())
+    names = _exception_names(exc)
+    status = getattr(getattr(exc, "response", None), "status_code", None)
+    gated = "GatedRepoError" in names
+    not_found = names & {"RepositoryNotFoundError", "RevisionNotFoundError"}
+    offline = names & {"LocalEntryNotFoundError", "OfflineModeIsEnabled"}
+
+    steps = (
+        f"1) примите условия: {DATASET_URL}\n"
+        "2) создайте токен с правом read: https://huggingface.co/settings/tokens\n"
+        "3) export HF_TOKEN=<токен> (или hf auth login) и повторите запуск; токен не коммитьте."
+    )
+
+    if gated:
+        if not token:
+            return (
+                "Набор закрыт условиями, а токен не задан (HF_TOKEN пуст).\n"
+                + steps
+                + f"\nОтвет клиента: {message}"
+            )
+        return (
+            "HF_TOKEN задан, но доступ к набору не выдан.\n"
+            "Проверьте, что условия приняты именно тем аккаунтом, которому принадлежит токен "
+            f"(страница: {DATASET_URL}), и что у токена есть право read.\n"
+            f"Ответ клиента: {message}"
+        )
+
+    if not_found:
+        return (
+            f"Набор или файлы {subset} не найдены. Для закрытых наборов та же ошибка 401 "
+            "означает отсутствие доступа.\n"
+            + steps
+            + f"\nОтвет клиента: {message}"
+        )
+
+    if offline:
+        return (
+            "Не удалось получить файлы с huggingface.co (нет сети, HF_HUB_OFFLINE=1 "
+            f"или включён офлайн-режим).\nОтвет клиента: {message}"
+        )
+
+    if status in (401, 403) or "gated" in lowered or "401" in message or "403" in message:
+        return (
+            "Похоже, доступ к набору не подтверждён (HTTP 401/403).\n"
+            + steps
+            + f"\nОтвет клиента: {message}"
+        )
+
+    return (
+        f"Не удалось скачать {subset}. Частично загруженные файлы сохранены, "
+        "повторный запуск продолжит скачивание.\n"
+        f"Ответ клиента: {message}"
+    )
 
 
 def human_size(size: int) -> str:
@@ -298,6 +377,60 @@ def cmd_inspect(key: str, as_json: bool) -> int:
     return 0
 
 
+def _count_files(path: str) -> int:
+    """Сколько файлов реально лежит в скачанной папке (без .cache Hugging Face)."""
+    if not os.path.isdir(path):
+        return 0
+    total = 0
+    for root, dirs, names in os.walk(path):
+        dirs[:] = [name for name in dirs if name != ".cache"]
+        total += len(names)
+    return total
+
+
+def _free_bytes(path: str) -> int:
+    """Свободное место на разделе, где лежит path (сам path может ещё не существовать)."""
+    probe = os.path.abspath(path)
+    while not os.path.isdir(probe):
+        parent = os.path.dirname(probe)
+        if parent == probe:
+            break
+        probe = parent
+    return shutil.disk_usage(probe).free
+
+
+def _subset_size(key: str):
+    """Сводка по подмножеству из API; None, если API недоступен (не блокирует скачивание)."""
+    try:
+        return summarize(key, fetch_tree(ORGANS[key]["subset"]))
+    except SystemExit:
+        return None
+
+
+def _download_plan(keys: list, out_dir: str) -> dict:
+    rows = []
+    for organ_key in keys:
+        stats = _subset_size(organ_key)
+        rows.append(
+            {
+                "organ": organ_key,
+                "subset": ORGANS[organ_key]["subset"],
+                "target": os.path.join(out_dir, ORGANS[organ_key]["subset"]),
+                "files": stats["total_files"] if stats else None,
+                "bytes": stats["total_bytes"] if stats else None,
+            }
+        )
+    known = [row for row in rows if row["bytes"] is not None]
+    return {
+        "dry_run": True,
+        "target_root": out_dir,
+        "free_bytes": _free_bytes(out_dir),
+        "total_bytes": sum(row["bytes"] for row in known) if known else None,
+        "size_known": len(known) == len(rows),
+        "downloads": rows,
+    }
+
+
 def _write_sources_file(out_dir: str, keys: list) -> str:
     lines = [
         "# Источники данных: FLARE PancancerCTSeg",
@@ -346,7 +479,29 @@ def _write_sources_file(out_dir: str, keys: list) -> str:
     return path
 
 
-def cmd_download(key: str, out_dir: str, as_json: bool) -> int:
+def cmd_download(key: str, out_dir: str, as_json: bool, dry_run: bool = False) -> int:
+    keys = list(ORGANS) if key == "all" else [key]
+
+    if dry_run:
+        plan = _download_plan(keys, out_dir)
+        if as_json:
+            print(json.dumps(plan, ensure_ascii=False, indent=2))
+            return 0
+        print(f"Пробный запуск: ничего не скачивается. Каталог: {os.path.abspath(out_dir)}")
+        for row in plan["downloads"]:
+            size = human_size(row["bytes"]) if row["bytes"] is not None else "объём неизвестен"
+            files = row["files"] if row["files"] is not None else "?"
+            print(f"  {ORGANS[row['organ']]['name_ru']}: {files} файл(ов), {size}")
+            print(f"    -> {row['target']}")
+        free = human_size(plan["free_bytes"])
+        if plan["total_bytes"] is None:
+            print(f"Свободно на диске: {free}")
+        else:
+            print(f"Свободно на диске: {free}; нужно: {human_size(plan['total_bytes'])}")
+            if plan["free_bytes"] < plan["total_bytes"]:
+                print("! Свободного места меньше объёма данных — укажите --out на другой диск.")
+        return 0
+
     try:
         from huggingface_hub import snapshot_download
     except ImportError:
@@ -355,46 +510,92 @@ def cmd_download(key: str, out_dir: str, as_json: bool) -> int:
             "    pip install -U huggingface_hub"
         )
 
-    keys = list(ORGANS) if key == "all" else [key]
-    os.makedirs(out_dir, exist_ok=True)
+    # Предупредим о нехватке места заранее: поджелудочная железа занимает ~166 GB.
+    plan = _download_plan(keys, out_dir)
+    if plan["total_bytes"] is not None:
+        print(
+            f"Нужно {human_size(plan['total_bytes'])}, свободно "
+            f"{human_size(plan['free_bytes'])} в {os.path.abspath(out_dir)}",
+            file=sys.stderr,
+        )
+        if plan["free_bytes"] < plan["total_bytes"]:
+            print(
+                "! Свободного места меньше объёма данных: скачивание может оборваться. "
+                "Укажите --out на диск побольше или выберите --organ adrenal.",
+                file=sys.stderr,
+            )
+
     results = []
+    failures = []
 
     for organ_key in keys:
         organ = ORGANS[organ_key]
-        print(
-            f"Скачиваю {organ['name_ru']} ({organ['subset']}) в {out_dir} ...",
-            file=sys.stderr,
-        )
+        subset = organ["subset"]
+        print(f"Скачиваю {organ['name_ru']} ({subset}) в {out_dir} ...", file=sys.stderr)
         try:
             path = snapshot_download(
                 repo_id=DATASET_ID,
                 repo_type="dataset",
                 local_dir=out_dir,
-                allow_patterns=[f"{organ['subset']}/**"],
+                allow_patterns=[f"{subset}/**"],
             )
-        except Exception as exc:  # noqa: BLE001 - сообщение зависит от версии клиента
-            message = str(exc)
-            lowered = message.lower()
-            if "gated" in lowered or "401" in message or "403" in message:
-                raise SystemExit(
-                    "Доступ к набору не подтверждён.\n"
-                    f"1) примите условия: {DATASET_URL}\n"
-                    "2) создайте токен с правом read: https://huggingface.co/settings/tokens\n"
-                    "3) export HF_TOKEN=<токен> и повторите запуск (токен не коммитьте).\n"
-                    f"Ответ клиента: {message}"
-                )
-            raise SystemExit(f"Не удалось скачать {organ['subset']}: {message}")
-        results.append({"organ": organ_key, "subset": organ["subset"], "path": path})
+        except KeyboardInterrupt:
+            print(
+                "\nСкачивание прервано (Ctrl+C). Уже загруженные файлы остались на диске; "
+                "повторный запуск продолжит с того же места.",
+                file=sys.stderr,
+            )
+            return 130
+        except Exception as exc:  # noqa: BLE001 - текст и тип зависят от версии клиента
+            failures.append({"organ": organ_key, "subset": subset, "error": str(exc)})
+            print(f"! {download_error(exc, subset)}", file=sys.stderr)
+            continue
 
-    sources_file = _write_sources_file(out_dir, keys)
+        local_path = os.path.join(path, subset)
+        files = _count_files(local_path)
+        if not files:
+            print(
+                f"! В {local_path} нет файлов: шаблон {subset}/** ничего не нашёл.",
+                file=sys.stderr,
+            )
+        results.append(
+            {"organ": organ_key, "subset": subset, "path": local_path, "files": files}
+        )
+
+    sources_file = None
+    if results:
+        os.makedirs(out_dir, exist_ok=True)
+        sources_file = _write_sources_file(out_dir, [row["organ"] for row in results])
+
     if as_json:
-        print(json.dumps({"downloads": results, "sources_file": sources_file}, ensure_ascii=False, indent=2))
-        return 0
+        print(
+            json.dumps(
+                {
+                    "downloads": results,
+                    "failures": failures,
+                    "sources_file": sources_file,
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return 1 if failures else 0
 
     for result in results:
-        print(f"Готово: {ORGANS[result['organ']]['name_ru']} -> "
-              f"{os.path.join(result['path'], ORGANS[result['organ']]['subset'])}")
-    print(f"Описание источников и лицензий: {sources_file}")
+        print(
+            f"Готово: {ORGANS[result['organ']]['name_ru']} -> {result['path']} "
+            f"({result['files']} файл(ов))"
+        )
+    if sources_file:
+        print(f"Описание источников и лицензий: {sources_file}")
+    sys.stdout.flush()
+    if failures:
+        print(
+            f"Не удалось скачать: {', '.join(ORGANS[row['organ']]['name_ru'] for row in failures)}. "
+            "Повторите запуск после исправления ошибки — уже скачанное не загружается заново.",
+            file=sys.stderr,
+        )
+        return 1
     return 0
 
 
@@ -445,6 +646,11 @@ def build_parser() -> argparse.ArgumentParser:
     download_parser.add_argument(
         "--out", default="data", help="каталог для данных (по умолчанию data)"
     )
+    download_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="показать объём, число файлов и целевые папки, ничего не скачивая",
+    )
 
     return parser
 
@@ -458,7 +664,7 @@ def main(argv=None) -> int:
     if args.command == "inspect":
         return cmd_inspect(args.organ, args.json)
     if args.command == "download":
-        return cmd_download(args.organ, args.out, args.json)
+        return cmd_download(args.organ, args.out, args.json, args.dry_run)
 
     parser.print_help()
     return 2

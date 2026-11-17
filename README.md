@@ -29,8 +29,16 @@ python tools/flare_organs.py list                 # links, case counts, sources,
 python tools/flare_organs.py inspect --organ all  # file counts and sizes via the HF API
 pip install -U huggingface_hub
 export HF_TOKEN=...                               # token is read from the environment, never stored
-python tools/flare_organs.py download --organ all --out data
+python tools/flare_organs.py download --organ all --dry-run      # sizes, free space, target paths
+python tools/flare_organs.py download --organ adrenal --out data # 52 cases, ~2.1 GB
+python tools/flare_organs.py download --organ all --out data     # ~168 GB (pancreas is ~166 GB)
 ```
+
+`--dry-run` prints the file counts, volume and free space on the target disk without downloading
+anything; the same size check runs before a real download and warns when the disk is too small.
+Already downloaded files are skipped, so an interrupted download (Ctrl+C, network failure, full disk)
+resumes on the next run. If one subset fails, the other is still fetched and the script exits with
+code 1, listing what is missing. Add `--json` to any command to get machine-readable output.
 
 `download` also writes `data/FLARE_SOURCES.md` with the source datasets, licences and citations
 (PanTS, PANORAMA, MSD-Pancreas, PanTrack, Adrenal-ACC-Ki67-Seg). The collection itself is licensed
