@@ -197,6 +197,31 @@ cd Radiomics-Atlas
 
 ---
 
+## 🧫 Воксельные КТ-датасеты: поджелудочная железа и надпочечники
+
+Этот атлас содержит радиомические признаки нормальных поджелудочной железы и надпочечников. Если нужны исходные воксельные КТ-разметки, они опубликованы в наборе [FLARE-MedFM/PancancerCTSeg](https://huggingface.co/datasets/FLARE-MedFM/PancancerCTSeg) — данные MICCAI 2026 Challenge: Pan-cancer segmentation in CT scans ([codabench](https://www.codabench.org/competitions/7149/)). Доступ закрыт условиями (gated): примите условия на странице набора и перед скачиванием задайте `HF_TOKEN`.
+
+| Орган | Подмножество | Случаев | Разметка | Ссылка |
+|-------|--------------|---------|----------|--------|
+| Поджелудочная железа | `train_per_cancer_type/Dataset006_PancreaticCancer` | 1797 | опухоль (`labelsTr`) + маска органа (`labelsTr_organ`: 0 = фон, 1 = орган, 2 = опухоль) | [открыть](https://huggingface.co/datasets/FLARE-MedFM/PancancerCTSeg/tree/main/train_per_cancer_type/Dataset006_PancreaticCancer) |
+| Надпочечники | `train_per_cancer_type/Dataset005_AdrenalCancer` | 52 | только опухоль, адренокортикальный рак (`labelsTr`) | [открыть](https://huggingface.co/datasets/FLARE-MedFM/PancancerCTSeg/tree/main/train_per_cancer_type/Dataset005_AdrenalCancer) |
+
+Источники: PanTS (876, CC BY-NC-ND 4.0), PANORAMA (479, CC BY 4.0), MSD-Pancreas (281, CC BY-SA 4.0), PanTrack (161, CC BY-NC-SA 4.0) для поджелудочной железы и Adrenal-ACC-Ki67-Seg (52, CC BY 3.0) для надпочечников. Лицензия самого набора — CC BY-NC 4.0, лицензии исходных наборов различаются.
+
+Скрипт в репозитории показывает эти подмножества, считает файлы и объём без скачивания (через API Hugging Face) и загружает только нужные папки:
+
+```bash
+python tools/flare_organs.py list                 # ссылки, число случаев, источники, лицензии
+python tools/flare_organs.py inspect --organ all  # файлы и объём по папкам через API
+pip install -U huggingface_hub
+export HF_TOKEN=...                               # токен читается из окружения и не сохраняется
+python tools/flare_organs.py download --organ all --out data
+```
+
+После загрузки скрипт пишет `data/FLARE_SOURCES.md` с источниками, лицензиями и цитированием. Учтите, что маска органа в `labelsTr_organ/` получена автоматически (TotalSegmentator) и вручную не проверялась, а для надпочечников отдельной маски нормального органа в наборе нет.
+
+---
+
 ## 🔬 Применение
 
 Набор данных подходит для:
